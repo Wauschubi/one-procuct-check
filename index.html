@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>One Product Check</title>
+  </head>
+  <body>
+    <h1>One Product Check</h1>
+    <button id="btn">Status prüfen</button>
+    <pre id="out">Bereit.</pre>
+
+    <script>
+      const out = document.getElementById('out');
+      document.getElementById('btn').onclick = async () => {
+        out.textContent = 'Prüfe…';
+        try {
+          const r = await fetch('/api/check');
+          const text = await r.text(); // erst Text, um Fehler besser zu sehen
+          try {
+            const data = JSON.parse(text);
+            out.textContent = JSON.stringify(data, null, 2);
+          } catch {
+            out.textContent = 'Antwort (kein JSON):\\n' + text;
+          }
+        } catch (e) {
+          out.textContent = 'Fetch-Fehler: ' + e.message;
+        }
+      };
+    </script>
+  </body>
+</html>
