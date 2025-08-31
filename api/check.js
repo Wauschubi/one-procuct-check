@@ -1,10 +1,9 @@
 import * as cheerio from "cheerio";
 import { fetch } from "undici";
 
-// ✏️ Deine Digitec-Produkt-URL:
+// ✏️ Deine Digitec-Produkt-URL
 const PRODUCT_URL = "https://www.digitec.ch/de/s1/product/gigabyte-geforce-rtx-5090-gaming-oc-32-gb-grafikkarte-53969798";
 
-// ----------------- Helfer -----------------
 const norm = s => s?.replace(/\s+/g, " ").trim() || "";
 
 function extractNextData($) {
@@ -12,14 +11,10 @@ function extractNextData($) {
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return null; }
 }
-
 function inferFromNextData(data) {
-  // Generischer Heuristik-Parser: durchsucht die JSON-Struktur nach inStock/availability/stock/price
   const out = { availability: null, stock: null, name: null, price: null };
-
-  // 1) Name/Preis (häufig)
   const s = JSON.stringify(data);
-  // Preis als Zahl oder String
+
   const priceNum = s.match(/"price"\s*:\s*(\d+(?:\.\d+)?)/i);
   const priceStr = s.match(/"price"\s*:\s*"([^"]+)"/i);
   out.price = priceStr?.[1] ?? priceNum?.[1] ?? null;
@@ -27,8 +22,6 @@ function inferFromNextData(data) {
   const nameStr = s.match(/"name"\s*:\s*"([^"]{3,200})"/i);
   if (nameStr) out.name = nameStr[1];
 
-  // 2) Availability / Stock
-  // booleans/strings wie "inStock":true, "availability":"InStock", "stock":5
   const inStockBool = /"inStock"\s*:\s*true/i.test(s) || /"available"\s*:\s*true/i.test(s);
   const stockNum = s.match(/"stock"\s*:\s*(\d+)/i);
   const availStr = s.match(/"availability"\s*:\s*"([^"]+)"/i);
@@ -37,20 +30,16 @@ function inferFromNextData(data) {
   if (inStockBool || /instock/i.test(availStr?.[1] || "")) out.availability = "in_stock";
   else if (/outofstock|out_of_stock/i.test(availStr?.[1] || "")) out.availability = "out_of_stock";
 
-  // 3) Falls im JSON Texte wie "Stück an Lager" stehen
   const stockText = s.match(/(\d+)\s*St\u00fcck an Lager|(\d+)\s*Stück an Lager/i);
   if (!out.stock && stockText) {
     out.stock = parseInt(stockText[1] || stockText[2], 10);
     out.availability = out.stock > 0 ? "in_stock" : "out_of_stock";
   }
-
   return out;
 }
-
 function parseFromLdJson($) {
   const blocks = $('script[type="application/ld+json"]');
   let name = null, price = null, availability = null;
-
   blocks.each((_, el) => {
     try {
       const txt = $(el).contents().text();
@@ -71,34 +60,28 @@ function parseFromLdJson($) {
       }
     } catch {}
   });
-
   return { name, price, availability };
 }
-
 function parseDigitecAvailability($) {
   const body = norm($("body").text());
-  const out = { availability: null, stock: null, shipping: null, pickup: [] };
+  const out = { availability: null, stock: null };
 
   const mStock = body.match(/(\d+)\s*St(ü|u)ck an Lager/i);
   if (mStock) {
     out.stock = parseInt(mStock[1], 10);
     out.availability = out.stock > 0 ? "in_stock" : "out_of_stock";
   }
-
-  const mShip = body.match(/\b(Heute|Morgen|Übermorgen|In \d+ Tagen)\b mit (Blitzlieferung|Standardversand)/i);
-  if (mShip) out.shipping = `${mShip[1]} mit ${mShip[2]}`;
-
-  const pickupRegex = /([A-Za-zÄÖÜäöüß .\-]+):\s*(Heute|Morgen|Übermorgen)\s*abholbereit/gi;
-  let p;
-  while ((p = pickupRegex.exec(body)) !== null) {
-    out.pickup.push(`${p[1].trim()} (${p[2]})`);
-  }
-  if (!out.availability && out.pickup.length > 0) out.availability = "in_stock";
-
-  const ariaAvail = $('[aria-label="verfügbar"]').length > 0;
-  if (!out.availability && ariaAvail) out.availability = "in_stock";
-
+  if (!out.availability && $('[aria-label="verfügbar"]').length > 0) out.availability = "in_stock";
   return out;
+}
+function getProductName($) {
+  const og = $('meta[property="og:title"]').attr('content');
+  if (og?.trim()) return og.trim();
+  const title = $('title').text();
+  if (title?.trim()) return title.replace(/\s*\|\s*digitec.*$/i, '').trim();
+  const h1 = $('h1').first().text();
+  if (h1?.trim()) return h1.trim();
+  return null;
 }
 
 // ----------------- API -----------------
@@ -114,37 +97,54 @@ export default async function handler(req, res) {
     const html = await r.text();
     const $ = cheerio.load(html);
 
-    // 1) Next.js __NEXT_DATA__ (falls vorhanden)
-    let { availability, stock, name, price } = (extractNextData($) ? inferFromNextData(extractNextData($)) : {});
+    // Debug-Flags
+    const hasOgTitle = !!$('meta[property="og:title"]').attr('content');
+    const hasTitle   = !!$('title').text().trim();
+    const hasH1      = !!$('h1').first().text().trim();
 
-    // 2) JSON-LD / Meta
-    if (!name || !price || !availability) {
-      const meta = parseFromLdJson($);
-      name = name ?? meta.name;
-      price = price ?? meta.price;
-      availability = availability ?? meta.availability;
+    // 0) Startwerte
+    let finalName = getProductName($);
+    let finalPrice = null;
+    let finalAvailability = null;
+    let finalStock = null;
+
+    // 1) Next.js-Daten
+    const nextData = extractNextData($);
+    if (nextData) {
+      const fromNext = inferFromNextData(nextData);
+      finalName = finalName ?? fromNext.name;
+      finalPrice = finalPrice ?? fromNext.price;
+      finalAvailability = finalAvailability ?? fromNext.availability;
+      finalStock = finalStock ?? fromNext.stock;
     }
 
-    // 3) Digitec-spezifische Textsignale
-    if (!availability || availability === "unknown") {
+    // 2) JSON-LD / Meta
+    const fromLd = parseFromLdJson($);
+    finalName = finalName ?? fromLd.name;
+    finalPrice = finalPrice ?? fromLd.price;
+    finalAvailability = finalAvailability ?? fromLd.availability;
+
+    // 3) Digitec-Text
+    if (!finalAvailability || finalAvailability === "unknown") {
       const dig = parseDigitecAvailability($);
-      availability = availability ?? dig.availability ?? "unknown";
-      stock = stock ?? dig.stock ?? null;
+      finalAvailability = finalAvailability ?? dig.availability ?? "unknown";
+      finalStock = finalStock ?? dig.stock ?? null;
     }
 
     // 4) Fallback grob
-    if (!availability) {
+    if (!finalAvailability) {
       const t = norm($("body").text()).toLowerCase();
-      if (/(nicht an lager|derzeit nicht verfügbar|ausverkauft|out of stock)/.test(t)) availability = "out_of_stock";
-      if (/(an lager|sofort lieferbar|lieferung morgen|in stock|ab lager)/.test(t)) availability = "in_stock";
+      if (/(nicht an lager|derzeit nicht verfügbar|ausverkauft|out of stock)/.test(t)) finalAvailability = "out_of_stock";
+      if (/(an lager|sofort lieferbar|lieferung morgen|in stock|ab lager)/.test(t)) finalAvailability = "in_stock";
     }
 
     res.status(200).json({
       ok: true,
-      name: name || null,
-      price: price || null,
-      availability: availability || "unknown",
-      stock: stock ?? null,
+      name: finalName || null,
+      price: finalPrice || null,
+      availability: finalAvailability || "unknown",
+      stock: finalStock ?? null,
+      debug: { hasOgTitle, hasTitle, hasH1 },
       checked_at: new Date().toISOString()
     });
   } catch (e) {
